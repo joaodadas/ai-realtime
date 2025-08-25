@@ -3,10 +3,10 @@ import WebSocket from 'ws';
 import fs from 'node:fs';
 import { exec } from 'node:child_process';
 
-// Junta chunks PCM16 mono 16k e salva .wav
+// salva PCM16 mono como WAV
 function savePcm16MonoWav(
   pcms: Buffer[],
-  sampleRate = 16000,
+  sampleRate = 24000,
   path = './out.wav'
 ) {
   const pcm = Buffer.concat(pcms);
@@ -14,13 +14,13 @@ function savePcm16MonoWav(
   h.write('RIFF', 0);
   h.writeUInt32LE(36 + pcm.length, 4);
   h.write('WAVEfmt ', 8);
-  h.writeUInt32LE(16, 16); // Subchunk1Size (PCM)
-  h.writeUInt16LE(1, 20); // AudioFormat (PCM)
-  h.writeUInt16LE(1, 22); // NumChannels (mono)
+  h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20);
+  h.writeUInt16LE(1, 22);
   h.writeUInt32LE(sampleRate, 24);
-  h.writeUInt32LE(sampleRate * 2, 28); // ByteRate (16-bit mono)
-  h.writeUInt16LE(2, 32); // BlockAlign
-  h.writeUInt16LE(16, 34); // BitsPerSample
+  h.writeUInt32LE(sampleRate * 2, 28);
+  h.writeUInt16LE(2, 32);
+  h.writeUInt16LE(16, 34);
   h.write('data', 36);
   h.writeUInt32LE(pcm.length, 40);
   fs.writeFileSync(path, Buffer.concat([h, pcm]));
@@ -30,6 +30,7 @@ function savePcm16MonoWav(
 async function main() {
   const KEY = process.env.OPENAI_API_KEY || '';
   const MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
+  const VOICE = process.env.VOICE || 'verse'; // <- opcional (verse/alloy/echo/sage/shimmer/ash/ballad/coral)
   if (!KEY) throw new Error('OPENAI_API_KEY ausente no .env');
 
   const ws = new WebSocket(
@@ -41,63 +42,72 @@ async function main() {
   );
 
   const audioChunks: Buffer[] = [];
+  let negotiatedHz = 24000; // default desejado
 
   ws.on('open', () => {
     console.log('✅ WS conectado');
 
-    // 1) Configura voz e formato de áudio da sessão
+    // CORRETO: configurar sessão
     ws.send(
       JSON.stringify({
-        type: 'conversation.item.create',
+        type: 'session.update',
         session: {
-          voice: 'verse',
-          output_audio_format: { type: 'pcm16', sample_rate_hz: 16000 },
+          voice: VOICE,
+          output_audio_format: 'pcm16',
         },
       })
     );
 
-    // 2) Pede resposta (texto + áudio)
+    // pedir resposta (texto + áudio)
     ws.send(
       JSON.stringify({
         type: 'response.create',
         response: {
           modalities: ['text', 'audio'],
-          instructions: 'Fale Olá com uma voz masculina.',
+          instructions: 'Olá consegue me falar sobre o minha casa minha vida?',
         },
       })
     );
   });
 
   ws.on('message', (data) => {
+    const s = data.toString();
     try {
-      const msg = JSON.parse(data.toString());
+      const msg = JSON.parse(s);
 
-      // Texto (stream)
+      if (msg.type === 'session.updated') {
+        const hz = msg.session?.output_audio_format?.sample_rate_hz;
+        if (typeof hz === 'number') {
+          negotiatedHz = hz;
+          console.log('🎚️ sample rate negociado =', hz, 'Hz');
+        }
+      }
+
       if (msg.type === 'response.text.delta') process.stdout.write(msg.delta);
       if (msg.type === 'response.text.done') process.stdout.write('\n');
 
-      // Áudio (PCM16 base64)
       if (msg.type === 'response.audio.delta') {
         audioChunks.push(Buffer.from(msg.delta, 'base64'));
       }
 
-      // Fim da resposta
       if (msg.type === 'response.done') {
         if (audioChunks.length) {
-          savePcm16MonoWav(audioChunks, 24000, './out.wav');
-          // Reproduz (macOS): comente se não quiser tocar automaticamente
-          exec('afplay ./out.wav');
-          // Linux (ALSA): exec('aplay ./out.wav');
+          savePcm16MonoWav(audioChunks, negotiatedHz, './out.wav');
+          // tocar (comente se não quiser):
+          exec(
+            process.platform === 'darwin'
+              ? 'afplay ./out.wav'
+              : 'aplay ./out.wav'
+          );
         }
         ws.close();
       }
 
-      // Erros do servidor (se houver)
       if (msg.type === 'error' || msg.error) {
         console.error('❌ Realtime error:', msg);
       }
     } catch {
-      // frames não-JSON (pings etc.) podem cair aqui — ignoramos
+      // frames não-JSON (pings) — ignore
     }
   });
 
